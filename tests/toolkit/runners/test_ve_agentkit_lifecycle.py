@@ -137,6 +137,7 @@ class _RecordingReporter:
         self.confirm_calls = []
         self.show_logs_calls = []
         self.long_task_descriptions = []
+        self.warning_messages = []
 
     def info(self, message, **kwargs):
         pass
@@ -145,7 +146,7 @@ class _RecordingReporter:
         pass
 
     def warning(self, message, **kwargs):
-        pass
+        self.warning_messages.append(message)
 
     def error(self, message, **kwargs):
         pass
@@ -358,7 +359,7 @@ def test_create_new_runtime_accepts_exclusive_gateway_with_network(monkeypatch):
     client = _FakeRuntimeClient(
         create_response=runtime_types.CreateRuntimeResponse(RuntimeId="rt-new"),
         get_runtime_responses=[
-            _fake_runtime(
+            _make_runtime(
                 status="Ready",
                 gateway_mode="Exclusive",
                 gateway_instance_id="g-123",
@@ -455,6 +456,37 @@ def test_create_new_runtime_init_failure_skips_cleanup_when_declined(monkeypatch
     assert client.delete_calls == []
     # No log url -> show_logs never invoked.
     assert reporter.show_logs_calls == []
+
+
+def test_runtime_recreate_gate_never_preserves_existing_runtime():
+    reporter = _RecordingReporter()
+    runner = VeAgentkitRuntimeRunner(reporter=reporter)
+    cfg = _make_config(
+        runtime_id="rt-stable",
+        runtime_recreate_policy="never",
+    )
+
+    assert runner._allow_runtime_recreate(cfg, "needs replacement") is False
+    assert reporter.confirm_calls == []
+    assert reporter.warning_messages == [
+        (
+            "Runtime rt-stable needs replacement; delete/recreate was not "
+            "confirmed, so the existing Runtime was preserved."
+        )
+    ]
+
+
+def test_runtime_recreate_gate_always_allows_without_prompt():
+    reporter = _RecordingReporter()
+    runner = VeAgentkitRuntimeRunner(reporter=reporter)
+    cfg = _make_config(
+        runtime_id="rt-replace",
+        runtime_recreate_policy="always",
+    )
+
+    assert runner._allow_runtime_recreate(cfg, "needs replacement") is True
+    assert reporter.confirm_calls == []
+    assert reporter.warning_messages == []
 
 
 def test_create_new_runtime_exception_maps_to_runtime_create_failed(monkeypatch):
@@ -705,8 +737,55 @@ def test_update_existing_runtime_rejects_gateway_binding_change(monkeypatch):
 
     assert result.success is False
     assert result.error_code == ErrorCode.CONFIG_INVALID
-    assert "cannot be changed after creation" in result.error
+    assert "gateway settings can only be applied when a Runtime is created" in (
+        result.error
+    )
+    assert "existing Runtime was preserved" in result.error
+    assert "gateway_mode" not in result.error
+    assert "gateway_instance_id" not in result.error
     assert client.update_calls == []
+    assert client.delete_calls == []
+
+
+def test_update_existing_runtime_recreates_on_gateway_change_when_allowed(monkeypatch):
+    runner = VeAgentkitRuntimeRunner()
+    existing = _make_runtime(
+        runtime_id="r-old",
+        status=RUNTIME_STATUS_READY,
+        gateway_mode="Shared",
+    )
+    recreated_ready = _make_runtime(
+        runtime_id="r-new",
+        status=RUNTIME_STATUS_READY,
+        gateway_mode="Exclusive",
+        gateway_instance_id="g-123",
+        api_key="k-new",
+    )
+    client = _FakeRuntimeClient(
+        create_response=runtime_types.CreateRuntimeResponse(RuntimeId="r-new"),
+        get_runtime_responses=[existing, recreated_ready],
+    )
+    _install_client(monkeypatch, runner, client)
+
+    cfg = _make_config(
+        runtime_id="r-old",
+        runtime_gateway_mode="Exclusive",
+        runtime_gateway_instance_id="g-123",
+        runtime_recreate_policy="always",
+    )
+    result = runner._update_existing_runtime(cfg)
+
+    assert result.success is True
+    assert client.update_calls == []
+    assert len(client.delete_calls) == 1
+    assert client.delete_calls[0].runtime_id == "r-old"
+    assert len(client.create_calls) == 1
+    create_req = client.create_calls[0]
+    assert create_req.gateway_mode == "Exclusive"
+    assert create_req.gateway_instance_id == "g-123"
+    assert result.service_id == "r-new"
+    assert result.metadata["runtime_id"] == "r-new"
+    assert cfg.runtime_id == "r-new"
 
 
 def test_update_existing_runtime_unreleased_triggers_release_then_ready(monkeypatch):
